@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Reliable GitHub Actions run monitor built around bounded one-shot `gh` queries."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
+
+VERSION = "0.1.0"
+
+EXIT_SUCCESS = 0
+EXIT_RUN_FAILED = 1
+EXIT_USAGE = 2
+EXIT_OVERALL_TIMEOUT = 3
+
+
+class QueryError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class RunState:
+    status: str
+    conclusion: str
+    url: str
+    jobs: tuple[tuple[str, str, str], ...]
+
+    @property
+    def snapshot(self) -> str:
+        parts = [f"run={self.status}/{self.conclusion or '-'}"]
+        parts.extend(
+            f"{name}={status}/{conclusion or '-'}"
+            for name, status, conclusion in self.jobs
+        )
+        return " | ".join(parts)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Monitor one GitHub Actions run using fresh bounded `gh run view` queries. "
+            "No long-lived `gh run watch` process is used."
+        )
+    )
+    parser.add_argument("run_id", help="GitHub Actions run ID")
+    parser.add_argument("--repo", metavar="OWNER/REPO", help="Repository; inferred from cwd when omitted")
+    parser.add_argument("--interval", type=float, default=15.0, help="Normal poll interval in seconds (default: 15)")
+    parser.add_argument("--timeout", type=float, default=3600.0, help="Overall monitor deadline in seconds (default: 3600)")
+    parser.add_argument("--query-timeout", type=float, default=20.0, help="Hard timeout for each gh query in seconds (default: 20)")
+    parser.add_argument("--max-backoff", type=float, default=60.0, help="Maximum transient-error backoff in seconds (default: 60)")
+    parser.add_argument("--heartbeat", type=float, default=300.0, help="Print an unchanged-state heartbeat every N seconds; 0 disables (default: 300)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    args = parser.parse_args()
+
+    for name in ("interval", "timeout", "query_timeout", "max_backoff"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be > 0")
+    if args.heartbeat < 0:
+        parser.error("--heartbeat must be >= 0")
+    return args
+
+
+def parse_payload(payload: Any) -> RunState:
+    if not isinstance(payload, dict):
+        raise QueryError("GitHub CLI returned a non-object JSON payload")
+
+    status = payload.get("status")
+    url = payload.get("url")
+    conclusion = payload.get("conclusion") or ""
+    raw_jobs = payload.get("jobs") or []
+
+    if not isinstance(status, str) or not status:
+        raise QueryError("GitHub CLI response is missing run status")
+    if not isinstance(url, str) or not url:
+        raise QueryError("GitHub CLI response is missing run URL")
+    if not isinstance(raw_jobs, list):
+        raise QueryError("GitHub CLI response contains invalid jobs data")
+
+    jobs: list[tuple[str, str, str]] = []
+    for job in raw_jobs:
+        if not isinstance(job, dict):
+            continue
+        name = str(job.get("name") or "?")
+        job_status = str(job.get("status") or "?")
+        job_conclusion = str(job.get("conclusion") or "")
+        jobs.append((name, job_status, job_conclusion))
+
+    return RunState(status=status, conclusion=conclusion, url=url, jobs=tuple(jobs))
+
+
+def query_run(run_id: str, repo: Optional[str], query_timeout: float) -> RunState:
+    command = [
+        "gh",
+        "run",
+        "view",
+        run_id,
+        "--json",
+        "status,conclusion,jobs,url",
+    ]
+    if repo:
+        command.extend(["--repo", repo])
+
+    env = os.environ.copy()
+    env.setdefault("GH_PROMPT_DISABLED", "1")
+    env.setdefault("GH_PAGER", "cat")
+    env.setdefault("NO_COLOR", "1")
+
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=query_timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise QueryError(f"gh query exceeded {query_timeout:g}s") from exc
+    except OSError as exc:
+        raise QueryError(f"failed to execute gh: {exc}") from exc
+
+    if completed.returncode != 0:
+        # Do not mirror gh stderr here. Authentication/network failures can include
+        # request details; the monitor only needs to classify this as retryable.
+        raise QueryError(f"gh query exited with status {completed.returncode}")
+
+    stdout = completed.stdout.strip()
+    if not stdout:
+        raise QueryError("gh query returned an empty response")
+
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise QueryError("gh query returned malformed JSON") from exc
+    return parse_payload(payload)
+
+
+def timestamp() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def sleep_until(seconds: float, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return
+    time.sleep(min(seconds, remaining))
+
+
+def main() -> int:
+    args = parse_args()
+    if shutil.which("gh") is None:
+        print("[ci-monitor] GitHub CLI `gh` is required and was not found in PATH", file=sys.stderr)
+        return EXIT_USAGE
+
+    deadline = time.monotonic() + args.timeout
+    last_snapshot: Optional[str] = None
+    last_output_at = 0.0
+    failure_streak = 0
+
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            print(f"[ci-monitor] overall timeout after {args.timeout:g}s", file=sys.stderr)
+            return EXIT_OVERALL_TIMEOUT
+
+        try:
+            state = query_run(args.run_id, args.repo, args.query_timeout)
+        except QueryError as exc:
+            failure_streak += 1
+            backoff = min(args.max_backoff, args.interval * failure_streak)
+            print(
+                f"[ci-monitor] query failed ({exc}; streak={failure_streak}); retry in {backoff:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep_until(backoff, deadline)
+            continue
+
+        failure_streak = 0
+        now = time.monotonic()
+        heartbeat_due = bool(args.heartbeat) and now - last_output_at >= args.heartbeat
+        if state.snapshot != last_snapshot or heartbeat_due:
+            suffix = " [heartbeat]" if state.snapshot == last_snapshot else ""
+            print(f"[{timestamp()}] {state.snapshot}{suffix}", flush=True)
+            last_snapshot = state.snapshot
+            last_output_at = now
+
+        if state.status == "completed":
+            result = state.conclusion or "unknown"
+            print(f"[ci-monitor] completed: {result} {state.url}", flush=True)
+            return EXIT_SUCCESS if result == "success" else EXIT_RUN_FAILED
+
+        sleep_until(args.interval, deadline)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n[ci-monitor] interrupted", file=sys.stderr)
+        raise SystemExit(130)
