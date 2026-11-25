@@ -30,7 +30,7 @@ EXIT_RUN_FAILED = 1
 EXIT_USAGE = 2
 EXIT_OVERALL_TIMEOUT = 3
 
-FAILURE_MARKER_PREFIX = "<!-- gitea-ci-failure"
+DEFAULT_FAILURE_MARKERS = ("<!-- ci-failure", "<!-- gitea-ci-failure")
 CONTEXT_ATTR_RE = re.compile(r'context="([^"]+)"')
 
 
@@ -113,12 +113,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-prefix",
         default="",
-        help="Optional Commit Status context prefix filter (e.g. 'gitea-ci')",
+        help="Optional Commit Status context prefix filter (e.g. 'ci /' or 'gitea-ci')",
+    )
+    parser.add_argument(
+        "--failure-marker",
+        default="",
+        help=(
+            "Optional substring marker used to identify CI failure summary commit comments "
+            "(default: matches '<!-- ci-failure' or '<!-- gitea-ci-failure')"
+        ),
     )
     parser.add_argument(
         "--no-failure-comment",
         action="store_true",
-        help="Do not fetch/print redacted failure commit comment when Commit Status fails",
+        help="Do not fetch/print failure summary commit comment when Commit Status fails",
     )
     parser.add_argument("--interval", type=float, default=15.0, help="Normal poll interval in seconds (default: 15)")
     parser.add_argument("--timeout", type=float, default=3600.0, help="Overall monitor deadline in seconds (default: 3600)")
@@ -294,20 +302,28 @@ def parse_commit_status_payload(
     )
 
 
-def extract_failure_comment(comments: Any, context_prefix: str = "") -> Optional[str]:
+def extract_failure_comment(
+    comments: Any,
+    context_prefix: str = "",
+    failure_marker: str = "",
+) -> Optional[str]:
     if not isinstance(comments, list):
         return None
+    markers = (failure_marker,) if failure_marker else DEFAULT_FAILURE_MARKERS
     for raw in reversed(comments):
         if not isinstance(raw, dict):
             continue
         body = raw.get("body")
-        if not isinstance(body, str) or FAILURE_MARKER_PREFIX not in body:
+        if not isinstance(body, str):
+            continue
+        matched = next((m for m in markers if m in body), None)
+        if matched is None:
             continue
         if context_prefix:
             m = CONTEXT_ATTR_RE.search(body)
             if m and not m.group(1).startswith(context_prefix):
                 continue
-        lines = [ln for ln in body.splitlines() if not ln.strip().startswith(FAILURE_MARKER_PREFIX)]
+        lines = [ln for ln in body.splitlines() if not ln.strip().startswith(matched)]
         cleaned = "\n".join(lines).strip()
         if cleaned:
             return cleaned
@@ -374,12 +390,18 @@ def query_commit_status(repo: str, sha: str, context_prefix: str, query_timeout:
     return parse_commit_status_payload(payload, repo, sha, context_prefix)
 
 
-def query_failure_comment(repo: str, sha: str, context_prefix: str, query_timeout: float) -> Optional[str]:
+def query_failure_comment(
+    repo: str,
+    sha: str,
+    context_prefix: str,
+    failure_marker: str,
+    query_timeout: float,
+) -> Optional[str]:
     try:
         payload = run_gh_json(["api", f"repos/{repo}/commits/{sha}/comments?per_page=30"], query_timeout)
     except QueryError:
         return None
-    return extract_failure_comment(payload, context_prefix)
+    return extract_failure_comment(payload, context_prefix, failure_marker)
 
 
 def timestamp() -> str:
@@ -531,7 +553,13 @@ def monitor_commit(args: argparse.Namespace, deadline: float) -> int:
                 print(f"[ci-monitor] completed: success {status_state.url}", flush=True)
                 return EXIT_SUCCESS
             if not args.no_failure_comment:
-                comment = query_failure_comment(repo, sha, args.context_prefix, args.query_timeout)
+                comment = query_failure_comment(
+                    repo,
+                    sha,
+                    args.context_prefix,
+                    args.failure_marker,
+                    args.query_timeout,
+                )
                 if comment:
                     print("--- Failure Summary (GitHub Commit Comment) ---", flush=True)
                     print(comment, flush=True)

@@ -161,6 +161,20 @@ class CommitStatusTests(unittest.TestCase):
 
         self.assertIsNone(module.extract_failure_comment(comments, context_prefix="unrelated"))
 
+        generic_comments = [
+            {
+                "body": '<!-- ci-failure context="jenkins / build" -->\nBuild broke at lint'
+            }
+        ]
+        generic = module.extract_failure_comment(generic_comments, context_prefix="jenkins")
+        self.assertEqual(generic, "Build broke at lint")
+
+        custom = module.extract_failure_comment(
+            [{"body": "[CUSTOM-FAIL]\nunit test error"}],
+            failure_marker="[CUSTOM-FAIL]",
+        )
+        self.assertEqual(custom, "unit test error")
+
 
 class ArgParsingTests(unittest.TestCase):
     def test_legacy_run_id_mode(self) -> None:

@@ -80,7 +80,8 @@ python .\gh-ci-monitor 123456789 --repo OWNER/REPO
 ```text
 usage: gh-ci-monitor [-h] [--repo OWNER/REPO] [--ref REF] [--commit SHA]
                      [--mode {auto,actions,status}] [--wait-start SECONDS]
-                     [--context-prefix PREFIX] [--no-failure-comment]
+                     [--context-prefix PREFIX] [--failure-marker MARKER]
+                     [--no-failure-comment]
                      [--interval SECONDS] [--timeout SECONDS]
                      [--query-timeout SECONDS] [--max-backoff SECONDS]
                      [--heartbeat SECONDS] [--version]
@@ -96,7 +97,8 @@ usage: gh-ci-monitor [-h] [--repo OWNER/REPO] [--ref REF] [--commit SHA]
 | `--commit` | 无 | 显式 40 位提交 SHA |
 | `--mode` | `auto` | `--ref`/`--commit` 时的监测模式：`auto`（先查 Actions 再查 Commit Status）、`actions`、`status` |
 | `--wait-start` | 45s | 等待 Webhook/外部 CI 首次写入 Run 或 Commit Status 的宽限时间 |
-| `--context-prefix` | 空 | 仅关注指定前缀的 Commit Status（如 `gitea-ci`） |
+| `--context-prefix` | 空 | 仅关注指定前缀的 Commit Status（如 `ci /`、`gitea-ci`） |
+| `--failure-marker` | `<!-- ci-failure` / `<!-- gitea-ci-failure` | 匹配失败摘要 Commit Comment 的标记前缀，可自定义以适配任意外部 CI |
 | `--no-failure-comment` | 关闭 | 设为 true 时，Commit Status 失败不再拉取并打印失败 Commit Comment 摘要 |
 | `--repo` | 当前仓库 | `OWNER/REPO` |
 | `--interval` | 15s | 正常轮询间隔 |
