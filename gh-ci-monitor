@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
-"""Reliable GitHub Actions run monitor built around bounded one-shot `gh` queries."""
+"""Reliable GitHub CI monitor built around bounded one-shot `gh` queries.
+
+Supports:
+- GitHub Actions runs by explicit `RUN_ID` (original mode, 100% backwards-compatible)
+- Commit/ref monitoring (`--ref HEAD` / `--commit SHA`) with `--mode auto|actions|status`,
+  allowing seamless monitoring of both GitHub Actions runs and external CI engines
+  (such as Gitea Actions) that report back via GitHub Commit Statuses & Commit Comments.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 EXIT_SUCCESS = 0
 EXIT_RUN_FAILED = 1
 EXIT_USAGE = 2
 EXIT_OVERALL_TIMEOUT = 3
+
+FAILURE_MARKER_PREFIX = "<!-- gitea-ci-failure"
+CONTEXT_ATTR_RE = re.compile(r'context="([^"]+)"')
 
 
 class QueryError(RuntimeError):
@@ -43,71 +55,104 @@ class RunState:
         return " | ".join(parts)
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(frozen=True)
+class StatusItem:
+    context: str
+    state: str
+    description: str
+    target_url: str
+
+
+@dataclass(frozen=True)
+class CommitStatusState:
+    sha: str
+    overall_state: str
+    started: bool
+    completed: bool
+    items: tuple[StatusItem, ...]
+    url: str
+
+    @property
+    def snapshot(self) -> str:
+        if not self.started:
+            return f"status=waiting ({self.sha[:8]})"
+        parts = [f"status={self.overall_state}"]
+        for item in self.items:
+            desc = f" ({item.description})" if item.description else ""
+            parts.append(f"{item.context}={item.state}{desc}")
+        return " | ".join(parts)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor one GitHub Actions run using fresh bounded `gh run view` queries. "
-            "No long-lived `gh run watch` process is used."
+            "Monitor GitHub Actions runs or external CI Commit Statuses (e.g. Gitea CI) "
+            "using fresh bounded `gh` queries. No long-lived `gh run watch` process is used."
         )
     )
-    parser.add_argument("run_id", help="GitHub Actions run ID")
+    parser.add_argument(
+        "run_id",
+        nargs="?",
+        help="GitHub Actions run ID (omit when using --ref or --commit)",
+    )
     parser.add_argument("--repo", metavar="OWNER/REPO", help="Repository; inferred from cwd when omitted")
+    parser.add_argument("--ref", metavar="REF", help="Git ref (e.g. HEAD, main, tag) to monitor via Actions or Commit Status")
+    parser.add_argument("--commit", metavar="SHA", help="Explicit commit SHA to monitor via Actions or Commit Status")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "actions", "status"),
+        default="auto",
+        help="Commit monitoring backend when using --ref/--commit (default: auto)",
+    )
+    parser.add_argument(
+        "--wait-start",
+        type=float,
+        default=45.0,
+        help="Max seconds to wait for a run or commit status to appear for --ref/--commit (default: 45)",
+    )
+    parser.add_argument(
+        "--context-prefix",
+        default="",
+        help="Optional Commit Status context prefix filter (e.g. 'gitea-ci')",
+    )
+    parser.add_argument(
+        "--no-failure-comment",
+        action="store_true",
+        help="Do not fetch/print redacted failure commit comment when Commit Status fails",
+    )
     parser.add_argument("--interval", type=float, default=15.0, help="Normal poll interval in seconds (default: 15)")
     parser.add_argument("--timeout", type=float, default=3600.0, help="Overall monitor deadline in seconds (default: 3600)")
     parser.add_argument("--query-timeout", type=float, default=20.0, help="Hard timeout for each gh query in seconds (default: 20)")
     parser.add_argument("--max-backoff", type=float, default=60.0, help="Maximum transient-error backoff in seconds (default: 60)")
     parser.add_argument("--heartbeat", type=float, default=300.0, help="Print an unchanged-state heartbeat every N seconds; 0 disables (default: 300)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    has_commit_target = bool(args.ref or args.commit)
+    if args.run_id and has_commit_target:
+        parser.error("RUN_ID cannot be combined with --ref or --commit")
+    if args.ref and args.commit:
+        parser.error("specify at most one of --ref or --commit")
+    if not args.run_id and not has_commit_target:
+        parser.error("provide either RUN_ID or --ref/--commit")
 
     for name in ("interval", "timeout", "query_timeout", "max_backoff"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be > 0")
     if args.heartbeat < 0:
         parser.error("--heartbeat must be >= 0")
+    if args.wait_start < 0:
+        parser.error("--wait-start must be >= 0")
     return args
 
 
-def parse_payload(payload: Any) -> RunState:
-    if not isinstance(payload, dict):
-        raise QueryError("GitHub CLI returned a non-object JSON payload")
-
-    status = payload.get("status")
-    url = payload.get("url")
-    conclusion = payload.get("conclusion") or ""
-    raw_jobs = payload.get("jobs") or []
-
-    if not isinstance(status, str) or not status:
-        raise QueryError("GitHub CLI response is missing run status")
-    if not isinstance(url, str) or not url:
-        raise QueryError("GitHub CLI response is missing run URL")
-    if not isinstance(raw_jobs, list):
-        raise QueryError("GitHub CLI response contains invalid jobs data")
-
-    jobs: list[tuple[str, str, str]] = []
-    for job in raw_jobs:
-        if not isinstance(job, dict):
-            continue
-        name = str(job.get("name") or "?")
-        job_status = str(job.get("status") or "?")
-        job_conclusion = str(job.get("conclusion") or "")
-        jobs.append((name, job_status, job_conclusion))
-
-    return RunState(status=status, conclusion=conclusion, url=url, jobs=tuple(jobs))
-
-
-def query_run(run_id: str, repo: Optional[str], query_timeout: float) -> RunState:
-    command = [
-        "gh",
-        "run",
-        "view",
-        run_id,
-        "--json",
-        "status,conclusion,jobs,url",
-    ]
-    if repo:
-        command.extend(["--repo", repo])
-
+def run_gh_json(gh_args: list[str], query_timeout: float) -> Any:
+    command = ["gh", *gh_args]
     env = os.environ.copy()
     env.setdefault("GH_PROMPT_DISABLED", "1")
     env.setdefault("GH_PAGER", "cat")
@@ -141,10 +186,200 @@ def query_run(run_id: str, repo: Optional[str], query_timeout: float) -> RunStat
         raise QueryError("gh query returned an empty response")
 
     try:
-        payload = json.loads(stdout)
+        return json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise QueryError("gh query returned malformed JSON") from exc
+
+
+def parse_payload(payload: Any) -> RunState:
+    if not isinstance(payload, dict):
+        raise QueryError("GitHub CLI returned a non-object JSON payload")
+
+    status = payload.get("status")
+    url = payload.get("url")
+    conclusion = payload.get("conclusion") or ""
+    raw_jobs = payload.get("jobs") or []
+
+    if not isinstance(status, str) or not status:
+        raise QueryError("GitHub CLI response is missing run status")
+    if not isinstance(url, str) or not url:
+        raise QueryError("GitHub CLI response is missing run URL")
+    if not isinstance(raw_jobs, list):
+        raise QueryError("GitHub CLI response contains invalid jobs data")
+
+    jobs: list[tuple[str, str, str]] = []
+    for job in raw_jobs:
+        if not isinstance(job, dict):
+            continue
+        name = str(job.get("name") or "?")
+        job_status = str(job.get("status") or "?")
+        job_conclusion = str(job.get("conclusion") or "")
+        jobs.append((name, job_status, job_conclusion))
+
+    return RunState(status=status, conclusion=conclusion, url=url, jobs=tuple(jobs))
+
+
+def parse_commit_status_payload(
+    payload: Any,
+    repo: str,
+    sha: str,
+    context_prefix: str = "",
+) -> CommitStatusState:
+    if not isinstance(payload, dict):
+        raise QueryError("GitHub commit status returned a non-object JSON payload")
+    raw_statuses = payload.get("statuses")
+    if not isinstance(raw_statuses, list):
+        raise QueryError("GitHub commit status payload missing statuses list")
+
+    items: list[StatusItem] = []
+    for raw in raw_statuses:
+        if not isinstance(raw, dict):
+            continue
+        context = str(raw.get("context") or "")
+        state = str(raw.get("state") or "").lower()
+        if not context or not state:
+            continue
+        if context_prefix and not context.startswith(context_prefix):
+            continue
+        items.append(
+            StatusItem(
+                context=context,
+                state=state,
+                description=str(raw.get("description") or "").strip(),
+                target_url=str(raw.get("target_url") or "").strip(),
+            )
+        )
+
+    items.sort(key=lambda it: it.context)
+    default_url = f"https://github.com/{repo}/commit/{sha}"
+
+    if not items:
+        return CommitStatusState(
+            sha=sha,
+            overall_state="waiting",
+            started=False,
+            completed=False,
+            items=(),
+            url=default_url,
+        )
+
+    states = {it.state for it in items}
+    target_url = next((it.target_url for it in items if it.target_url), default_url)
+    if "pending" in states:
+        return CommitStatusState(
+            sha=sha,
+            overall_state="pending",
+            started=True,
+            completed=False,
+            items=tuple(items),
+            url=target_url,
+        )
+    if states == {"success"}:
+        return CommitStatusState(
+            sha=sha,
+            overall_state="success",
+            started=True,
+            completed=True,
+            items=tuple(items),
+            url=target_url,
+        )
+    overall = "failure" if "failure" in states else "error"
+    return CommitStatusState(
+        sha=sha,
+        overall_state=overall,
+        started=True,
+        completed=True,
+        items=tuple(items),
+        url=target_url,
+    )
+
+
+def extract_failure_comment(comments: Any, context_prefix: str = "") -> Optional[str]:
+    if not isinstance(comments, list):
+        return None
+    for raw in reversed(comments):
+        if not isinstance(raw, dict):
+            continue
+        body = raw.get("body")
+        if not isinstance(body, str) or FAILURE_MARKER_PREFIX not in body:
+            continue
+        if context_prefix:
+            m = CONTEXT_ATTR_RE.search(body)
+            if m and not m.group(1).startswith(context_prefix):
+                continue
+        lines = [ln for ln in body.splitlines() if not ln.strip().startswith(FAILURE_MARKER_PREFIX)]
+        cleaned = "\n".join(lines).strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def query_run(run_id: str, repo: Optional[str], query_timeout: float) -> RunState:
+    gh_args = ["run", "view", run_id, "--json", "status,conclusion,jobs,url"]
+    if repo:
+        gh_args.extend(["--repo", repo])
+    payload = run_gh_json(gh_args, query_timeout)
     return parse_payload(payload)
+
+
+def resolve_repo(repo: Optional[str], query_timeout: float) -> str:
+    if repo:
+        return repo.strip()
+    payload = run_gh_json(["repo", "view", "--json", "nameWithOwner"], query_timeout)
+    if not isinstance(payload, dict) or not isinstance(payload.get("nameWithOwner"), str) or not payload["nameWithOwner"]:
+        raise QueryError("unable to resolve GitHub repository from current directory; pass --repo OWNER/REPO")
+    return payload["nameWithOwner"]
+
+
+def resolve_commit_sha(ref: str, repo: str, explicit_repo: bool, query_timeout: float) -> str:
+    if not explicit_repo and ref == "HEAD" and shutil.which("git") is not None:
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            sha = proc.stdout.strip()
+            if proc.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+                return sha
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    qref = urllib.parse.quote(ref, safe="")
+    payload = run_gh_json(["api", f"repos/{repo}/commits/{qref}"], query_timeout)
+    if not isinstance(payload, dict) or not isinstance(payload.get("sha"), str) or not payload["sha"]:
+        raise QueryError(f"unable to resolve ref {ref!r} on {repo}")
+    return payload["sha"]
+
+
+def find_latest_run_for_commit(repo: str, sha: str, query_timeout: float) -> Optional[str]:
+    payload = run_gh_json(["api", f"repos/{repo}/actions/runs?head_sha={sha}&per_page=10"], query_timeout)
+    if not isinstance(payload, dict):
+        raise QueryError("GitHub actions runs API returned non-object payload")
+    runs = payload.get("workflow_runs")
+    if not isinstance(runs, list) or not runs:
+        return None
+    first = runs[0]
+    if isinstance(first, dict) and first.get("id") is not None:
+        return str(first["id"])
+    return None
+
+
+def query_commit_status(repo: str, sha: str, context_prefix: str, query_timeout: float) -> CommitStatusState:
+    payload = run_gh_json(["api", f"repos/{repo}/commits/{sha}/status"], query_timeout)
+    return parse_commit_status_payload(payload, repo, sha, context_prefix)
+
+
+def query_failure_comment(repo: str, sha: str, context_prefix: str, query_timeout: float) -> Optional[str]:
+    try:
+        payload = run_gh_json(["api", f"repos/{repo}/commits/{sha}/comments?per_page=30"], query_timeout)
+    except QueryError:
+        return None
+    return extract_failure_comment(payload, context_prefix)
 
 
 def timestamp() -> str:
@@ -158,13 +393,7 @@ def sleep_until(seconds: float, deadline: float) -> None:
     time.sleep(min(seconds, remaining))
 
 
-def main() -> int:
-    args = parse_args()
-    if shutil.which("gh") is None:
-        print("[ci-monitor] GitHub CLI `gh` is required and was not found in PATH", file=sys.stderr)
-        return EXIT_USAGE
-
-    deadline = time.monotonic() + args.timeout
+def monitor_run_id(args: argparse.Namespace, run_id: str, repo: Optional[str], deadline: float) -> int:
     last_snapshot: Optional[str] = None
     last_output_at = 0.0
     failure_streak = 0
@@ -176,7 +405,7 @@ def main() -> int:
             return EXIT_OVERALL_TIMEOUT
 
         try:
-            state = query_run(args.run_id, args.repo, args.query_timeout)
+            state = query_run(run_id, repo, args.query_timeout)
         except QueryError as exc:
             failure_streak += 1
             backoff = min(args.max_backoff, args.interval * failure_streak)
@@ -203,6 +432,126 @@ def main() -> int:
             return EXIT_SUCCESS if result == "success" else EXIT_RUN_FAILED
 
         sleep_until(args.interval, deadline)
+
+
+def monitor_commit(args: argparse.Namespace, deadline: float) -> int:
+    start_at = time.monotonic()
+    explicit_repo = bool(args.repo)
+    repo: Optional[str] = None
+    sha: Optional[str] = args.commit.strip() if args.commit else None
+    failure_streak = 0
+
+    while repo is None or sha is None:
+        if time.monotonic() >= deadline:
+            print(f"[ci-monitor] overall timeout after {args.timeout:g}s", file=sys.stderr)
+            return EXIT_OVERALL_TIMEOUT
+        try:
+            if repo is None:
+                repo = resolve_repo(args.repo, args.query_timeout)
+            if sha is None:
+                sha = resolve_commit_sha(args.ref, repo, explicit_repo, args.query_timeout)
+        except QueryError as exc:
+            failure_streak += 1
+            backoff = min(args.max_backoff, args.interval * failure_streak)
+            print(
+                f"[ci-monitor] resolve failed ({exc}; streak={failure_streak}); retry in {backoff:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep_until(backoff, deadline)
+
+    print(f"[ci-monitor] tracking {repo}@{sha[:8]} (mode={args.mode})", flush=True)
+
+    active_mode = args.mode
+    last_snapshot: Optional[str] = None
+    last_output_at = 0.0
+    failure_streak = 0
+    wait_deadline = min(deadline, start_at + args.wait_start)
+
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            print(f"[ci-monitor] overall timeout after {args.timeout:g}s", file=sys.stderr)
+            return EXIT_OVERALL_TIMEOUT
+
+        try:
+            if active_mode in ("auto", "actions"):
+                run_id = find_latest_run_for_commit(repo, sha, args.query_timeout)
+                if run_id is not None:
+                    print(f"[ci-monitor] detected GitHub Actions run {run_id} for {repo}@{sha[:8]}", flush=True)
+                    return monitor_run_id(args, run_id, repo, deadline)
+                if active_mode == "actions":
+                    status_state = CommitStatusState(
+                        sha=sha,
+                        overall_state="waiting",
+                        started=False,
+                        completed=False,
+                        items=(),
+                        url=f"https://github.com/{repo}/commit/{sha}",
+                    )
+                else:
+                    status_state = query_commit_status(repo, sha, args.context_prefix, args.query_timeout)
+                    if status_state.started:
+                        active_mode = "status"
+            else:
+                status_state = query_commit_status(repo, sha, args.context_prefix, args.query_timeout)
+        except QueryError as exc:
+            failure_streak += 1
+            backoff = min(args.max_backoff, args.interval * failure_streak)
+            print(
+                f"[ci-monitor] query failed ({exc}; streak={failure_streak}); retry in {backoff:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep_until(backoff, deadline)
+            continue
+
+        failure_streak = 0
+        now = time.monotonic()
+        heartbeat_due = bool(args.heartbeat) and now - last_output_at >= args.heartbeat
+        if status_state.snapshot != last_snapshot or heartbeat_due:
+            suffix = " [heartbeat]" if status_state.snapshot == last_snapshot else ""
+            print(f"[{timestamp()}] {status_state.snapshot}{suffix}", flush=True)
+            last_snapshot = status_state.snapshot
+            last_output_at = now
+
+        if not status_state.started:
+            if now >= wait_deadline:
+                print(
+                    f"[ci-monitor] no GitHub Actions run or Commit Status appeared for {repo}@{sha[:8]} within {args.wait_start:g}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return EXIT_OVERALL_TIMEOUT
+            sleep_until(min(args.interval, 5.0), min(wait_deadline, deadline))
+            continue
+
+        if status_state.completed:
+            if status_state.overall_state == "success":
+                print(f"[ci-monitor] completed: success {status_state.url}", flush=True)
+                return EXIT_SUCCESS
+            if not args.no_failure_comment:
+                comment = query_failure_comment(repo, sha, args.context_prefix, args.query_timeout)
+                if comment:
+                    print("--- Failure Summary (GitHub Commit Comment) ---", flush=True)
+                    print(comment, flush=True)
+                    print("-----------------------------------------------", flush=True)
+            print(f"[ci-monitor] completed: {status_state.overall_state} {status_state.url}", flush=True)
+            return EXIT_RUN_FAILED
+
+        sleep_until(args.interval, deadline)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+    if shutil.which("gh") is None:
+        print("[ci-monitor] GitHub CLI `gh` is required and was not found in PATH", file=sys.stderr)
+        return EXIT_USAGE
+
+    deadline = time.monotonic() + args.timeout
+    if args.run_id:
+        return monitor_run_id(args, args.run_id, args.repo, deadline)
+    return monitor_commit(args, deadline)
 
 
 if __name__ == "__main__":
